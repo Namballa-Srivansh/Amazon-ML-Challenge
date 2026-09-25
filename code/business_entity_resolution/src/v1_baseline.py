@@ -12,12 +12,13 @@ Output:
     output/matching_results.tsv
     output/candidate_pairs.tsv
 """
+from __future__ import annotations   # Python 3.8 compat for dict[str, ...] hints
 
 import os
 import sys
-import io
-# Force UTF-8 output — prevents cp1252 crash on Windows with Indian/French names
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
 import pandas as pd
 
 # ---------------------------------------------------------------------------
@@ -29,7 +30,7 @@ STUDENT_RES  = os.path.join(REPO_ROOT, "6ab10eb3b23ba_student_resource", "studen
 
 TRAIN_DIR    = os.path.join(STUDENT_RES, "dataset", "train")
 TEST_DIR     = os.path.join(STUDENT_RES, "dataset", "test")
-OUTPUT_DIR   = os.path.join(STUDENT_RES, "output")   # validator expects output/ here
+OUTPUT_DIR   = os.path.join(STUDENT_RES, "output")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 
@@ -69,21 +70,29 @@ def build_candidates(s1: pd.DataFrame,
                      s3: pd.DataFrame) -> dict[str, list[str]]:
     """
     For every S1 entity, find S2/S3 records whose normalised business_name
-    AND country match exactly.
+    AND country match exactly. Skips records with empty business names.
 
     Returns: {source1_entity_id: [candidate_entity_id, ...]}
     """
     # Build lookup: (norm_name, country) -> list of entity_ids
+    # Use itertuples for speed (avoids per-row Series overhead of iterrows)
     lookup: dict[tuple, list[str]] = {}
     for src_df in [s2, s3]:
-        for _, row in src_df.iterrows():
-            key = (normalise(row["business_name"]), row["country"].strip())
-            lookup.setdefault(key, []).append(row["entity_id"])
+        for row in src_df.itertuples(index=False):
+            norm = normalise(row.business_name)
+            if not norm:          # skip records with empty business names
+                continue
+            key = (norm, row.country.strip())
+            lookup.setdefault(key, []).append(row.entity_id)
 
     candidates: dict[str, list[str]] = {}
-    for _, row in s1.iterrows():
-        eid  = row["entity_id"]
-        key  = (normalise(row["business_name"]), row["country"].strip())
+    for row in s1.itertuples(index=False):
+        eid  = row.entity_id
+        norm = normalise(row.business_name)
+        if not norm:              # empty name → singleton (no candidates)
+            candidates[eid] = []
+            continue
+        key  = (norm, row.country.strip())
         hits = lookup.get(key, [])
         # Deduplicate (shouldn't happen, but be safe)
         candidates[eid] = list(dict.fromkeys(hits))
@@ -123,9 +132,9 @@ def self_score(candidates: dict[str, list[str]],
     beta_sq = 0.25   # beta = 0.5
     scores  = []
 
-    for _, row in gt.iterrows():
-        s1_id     = row["source1_entity_id"]
-        gt_str    = row.get("matched_entity_ids", "")
+    for row in gt.itertuples(index=False):
+        s1_id     = row.source1_entity_id
+        gt_str    = getattr(row, "matched_entity_ids", "")
         gt_set    = set(gt_str.split(",")) - {""} if gt_str else set()
         pred_set  = set(candidates.get(s1_id, []))
 
