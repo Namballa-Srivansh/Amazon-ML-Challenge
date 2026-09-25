@@ -1,0 +1,33 @@
+# Virtual environment
+venv/
+.venv/
+env/
+
+# Dataset files — too large for git, download from challenge portal
+6ab10eb3b23ba_student_resource/student_resource/dataset/
+6ab10eb3b23ba_student_resource/student_resource/output/
+
+# macOS metadata
+__MACOSX/
+.DS_Store
+**/.DS_Store
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Temp / partial downloads
+*.crdownload
+
+# PDF text dump (generated)
+pdf_text.txt
+
+# IDE
+.vscode/
+.idea/
