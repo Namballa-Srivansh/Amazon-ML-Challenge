@@ -182,6 +182,12 @@ def main():
     cands_tr = process_split(s1_tr, s23_tr, s1_tr_keys, s23_tr_keys, vec)
     score_recall(cands_tr, os.path.join(TRAIN_DIR, "train_ground_truth.tsv"))
     
+    print("\nSaving candidate pairs for v3...")
+    rows_c = []
+    for sid in s1_tr["entity_id"]:
+        rows_c.append({"source1_entity_id": sid, "candidate_entity_ids": ",".join(cands_tr.get(sid, {}).keys())})
+    pd.DataFrame(rows_c).to_csv(os.path.join(OUTPUT_DIR, "candidate_pairs.tsv"), sep="\t", index=False)
+    
     print("\n[Done] Skipping TEST split during local development.")
 
 if __name__ == "__main__":
