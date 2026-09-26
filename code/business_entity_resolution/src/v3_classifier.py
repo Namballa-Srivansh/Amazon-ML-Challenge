@@ -31,9 +31,8 @@ import jellyfish
 # ---------------------------------------------------------------------------
 REPO_ROOT   = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(
                 os.path.abspath(__file__)))))
-STUDENT_RES = os.path.join(REPO_ROOT, "6ab10eb3b23ba_student_resource", "student_resource")
-TRAIN_DIR   = os.path.join(STUDENT_RES, "dataset", "mini_train")
-OUTPUT_DIR  = os.path.join(STUDENT_RES, "output")
+TRAIN_DIR   = os.path.join(REPO_ROOT, "dataset", "mini_train")
+OUTPUT_DIR  = os.path.join(REPO_ROOT, "output")
 MODELS_DIR  = os.path.join(REPO_ROOT, "models")
 
 os.makedirs(MODELS_DIR, exist_ok=True)
@@ -140,8 +139,8 @@ def main():
 
     # FIX: Fit vectorizers on TRAIN data only (no leakage into validation)
     print("  -> Fitting TF-IDF vectorizers on TRAIN split only...")
-    vec_name = TfidfVectorizer(analyzer="char_wb", ngram_range=(2,4), max_features=50_000, sublinear_tf=True)
-    vec_addr = TfidfVectorizer(analyzer="char_wb", ngram_range=(2,4), max_features=50_000, sublinear_tf=True)
+    vec_name = TfidfVectorizer(analyzer="char_wb", ngram_range=(2,4), max_features=10_000, sublinear_tf=True)
+    vec_addr = TfidfVectorizer(analyzer="char_wb", ngram_range=(2,4), max_features=10_000, sublinear_tf=True)
     vec_name.fit(list(set(tr_s1n + tr_cn)))
     vec_addr.fit(list(set(tr_s1a + tr_ca)))
 

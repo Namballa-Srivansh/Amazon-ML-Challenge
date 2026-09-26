@@ -8,17 +8,21 @@
 
 ## Submission Log
 
+> v4-v9 code exists in `src/` (as of 2026-09-26) but has not been executed on
+> real data yet — rows below stay blank until each script is actually run.
+> See HANDOFF.md Session 4 for what was written and why.
+
 | Version | Held-out F₀.₅ | Public LB F₀.₅ | Notes |
 |---------|--------------|----------------|-------|
-| v1 | — | — | |
-| v2 | — | — | |
-| v3 | — | — | |
-| v4 | — | — | |
-| v5 | — | — | |
-| v6 | — | — | |
-| v7 | — | — | |
-| v8 | — | — | |
-| v9 | — | — | |
+| v1 | — | — | Ran; format-valid baseline only |
+| v2 | 95.7% recall | — | Ran on mini_train |
+| v3 | 0.9332 | — | Ran on mini_train (thresh=0.90) |
+| v4 | — | — | Written, not run |
+| v5 | — | — | Written, not run |
+| v6 | — | — | Written, not run |
+| v7 | — | — | Written, not run |
+| v8 | — | — | Written, not run |
+| v9 | — | — | Written, not run |
 
 ---
 

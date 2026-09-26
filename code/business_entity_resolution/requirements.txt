@@ -6,3 +6,7 @@ sentence-transformers>=2.6.0
 xgboost>=2.0.0
 networkx>=3.2.0
 tqdm>=4.66.0
+metaphone>=0.6           # true Double Metaphone for v6 blocking (falls back to jellyfish if absent)
+ollama>=0.3.0            # Python client for local Qwen2.5-7B calls in v7
+# GPU inference path (v4_gpu_inference.py) additionally needs cupy matching your CUDA version,
+# e.g.: cupy-cuda12x>=13.0.0 -- install separately, not pinned here since it's hardware-specific.

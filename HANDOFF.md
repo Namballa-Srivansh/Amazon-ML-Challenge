@@ -31,10 +31,17 @@ as an open string label everywhere — never hardcode `{US, India}`.
 ## 🚦 Current Status
 
 ```
-VERSION:    v3 — Completed.
-STAGE:      v3_classifier.py finished training. Moving to v4.
-NEXT TASK:  Write v4_calibration.py to apply Platt scaling to the classifier.
-BLOCKER:    None.
+VERSION:    v4-v9 — Code written, NOT yet run against real data.
+STAGE:      All 9 versions now have implementations in src/. v1-v3 were run
+            and validated on mini_train. v4-v9 were written against the spec
+            and v1-v3's established patterns but have never been executed --
+            this repo copy has no dataset files in it.
+NEXT TASK:  Run v4_calibration.py through v9_final_ensemble.py locally, in
+            the order given in README.md Step 1, against the real
+            mini_train/train/test data. Expect bugs on first run (untested
+            code) -- report errors and numbers back before trusting any of
+            the v4-v9 F0.5 figures.
+BLOCKER:    None -- just needs a real run + debug pass.
 ```
 
 ---
@@ -54,12 +61,23 @@ BLOCKER:    None.
 - [x] Wrote `code/business_entity_resolution/requirements.txt`
 - [x] Wrote `utils/create_mini_dataset.py` (created 5% sample for fast local dev)
 - [x] Wrote `code/business_entity_resolution/src/v2_blocking.py` (multi-key + hot-key capping)
+- [x] Wrote `code/business_entity_resolution/src/v3_classifier.py` (LR, 9 features, entity-split, hard negatives) — val F0.5 = 0.9332 on mini_train
+- [x] Wrote `code/business_entity_resolution/src/generate_v3_submission.py` (memory-safe full-test inference for v3)
+- [x] Wrote `code/business_entity_resolution/src/retrain_10k.py`, `v4_fast_inference.py`, `v4_gpu_inference.py` (VRAM-fit + GPU inference experiments, done ahead of the versioned track — see Session 3)
+- [x] Wrote `code/business_entity_resolution/src/v4_calibration.py` (Platt scaling + ambiguous band) — **not yet run**
+- [x] Wrote `code/business_entity_resolution/src/v5_embeddings.py` (multilingual sentence-transformer features) — **not yet run**
+- [x] Wrote `code/business_entity_resolution/src/v6_blocking_metaphone.py` (Double Metaphone blocking) — **not yet run**
+- [x] Wrote `code/business_entity_resolution/src/v6_xgboost.py` (XGBoost classifier upgrade) — **not yet run**
+- [x] Wrote `code/business_entity_resolution/src/v7_qwen_jury.py` (Qwen2.5-7B ambiguous-band jury via Ollama, includes throughput test) — **not yet run**
+- [x] Wrote `code/business_entity_resolution/src/v8_graph_consistency.py` (triangle-consistency graph pruning) — **not yet run**
+- [x] Wrote `code/business_entity_resolution/src/v9_final_ensemble.py` (final full-test inference + LLM overrides + full-set threshold sweep) — **not yet run**
 
 ---
 
 ## 🔄 In Progress
 
-- [ ] **v3** — Logistic regression classifier, 9 engineered features, hard negatives, entity-level split
+- [ ] Run and debug v4→v9 against real mini_train/train/test data (code exists, execution doesn't)
+- [ ] Re-run v4_calibration.py specifically against v6's XGBoost scores (it currently calibrates whichever model/vectorizer paths you point it at — default in the file is v3's; see inline comment in README Step 1)
 
 ---
 
@@ -67,13 +85,13 @@ BLOCKER:    None.
 
 - [x] **v1** — Set up directory structure, load TSVs, dumb exact-match baseline, validate format
 - [x] **v2** — TF-IDF + KNN blocking, phonetic blocking, recall ≥ 95% gate
-- [ ] **v3** — Logistic regression classifier, 9 engineered features, hard negatives, entity-level split
-- [ ] **v4** — Platt calibration, threshold tuning, ambiguous band definition
-- [ ] **v5** — Multilingual sentence-transformer features
-- [ ] **v6** — Double Metaphone blocking + XGBoost upgrade
-- [ ] **v7** — Qwen2.5-7B on ambiguous band (test throughput FIRST!)
-- [ ] **v8** — Match graph + triangle consistency pruning
-- [ ] **v9** — Final ensemble, polish, submit
+- [x] **v3** — Logistic regression classifier, 9 engineered features, hard negatives, entity-level split (code + one real run)
+- [x] **v4** — Platt calibration, threshold tuning, ambiguous band definition (code written, needs a run)
+- [x] **v5** — Multilingual sentence-transformer features (code written, needs a run)
+- [x] **v6** — Double Metaphone blocking + XGBoost upgrade (code written, needs a run)
+- [x] **v7** — Qwen2.5-7B on ambiguous band, throughput test included (code written, needs a run + Ollama set up)
+- [x] **v8** — Match graph + triangle consistency pruning (code written, needs a run)
+- [x] **v9** — Final ensemble, polish, submit (code written, needs a run — this is what actually generates the leaderboard file)
 
 ---
 
@@ -97,13 +115,26 @@ amazon-ml-challenge/
 ├── code/
 │   └── business_entity_resolution/
 │       ├── src/
-│       │   ├── v1_baseline.py          # exact-match blocking
-│       │   ├── v2_blocking.py          # multi-key + hot-key capping blocking
-│       │   └── ...                     # v3–v9 to be added
+│       │   ├── v1_baseline.py             # exact-match blocking
+│       │   ├── v2_blocking.py             # multi-key + hot-key capping blocking
+│       │   ├── v3_classifier.py           # LR + 9 features, trains models/v3_*
+│       │   ├── generate_v3_submission.py  # v3-only full-test inference (memory-safe)
+│       │   ├── retrain_10k.py             # 10k-vocab retrain for GPU VRAM fit
+│       │   ├── v4_fast_inference.py       # sparse dot-product full-test inference
+│       │   ├── v4_gpu_inference.py        # CuPy/cuSPARSE tiled GPU inference
+│       │   ├── v4_calibration.py          # Platt scaling + ambiguous band -> models/v4_*
+│       │   ├── v5_embeddings.py           # + multilingual embedding features -> models/v5_*
+│       │   ├── v6_blocking_metaphone.py   # Double Metaphone blocking (overwrites candidate_pairs.tsv)
+│       │   ├── v6_xgboost.py              # XGBoost on 11 features -> models/v6_*
+│       │   ├── v7_qwen_jury.py            # Qwen2.5-7B ambiguous-band jury (Ollama)
+│       │   ├── v8_graph_consistency.py    # triangle-consistency pruning (edits matching_results.tsv)
+│       │   └── v9_final_ensemble.py       # FINAL full-test inference + LLM overrides + threshold sweep
 │       ├── README.md                   
 │       └── requirements.txt            
 ├── models/
-│   └── tfidf_vectorizer.pkl            # saved from v2 for downstream use
+│   ├── tfidf_vectorizer.pkl            # saved from v2 for downstream use
+│   └── v3_*.pkl, v3_threshold.txt      # v3 classifier + vectorizers + threshold
+│       (v4_*, v5_*, v6_* artifacts land here once those scripts are run)
 ├── HANDOFF.md                          # ✅ This file
 ├── VERSIONS.md                         # 9-version build plan
 ├── amazon_ml_challenge_2026_strategy.md
@@ -172,12 +203,69 @@ amazon-ml-challenge/
 | Public LB F₀.₅ — best so far | — | — (not yet submitted) |
 | Singletons correct | > 90% | 67.6% (39,895 wrongly matched) |
 | Total FP (false merges) | Minimise | 10,865,787 (v1) |
-| Ambiguous band size (% of candidates) | < 20% for Qwen budget | — |
-| Qwen2.5-7B throughput | Measure before v7 | — pairs/sec |
+| Ambiguous band size (% of candidates) | < 20% for Qwen budget | — (v4_calibration.py enforces this cap when run) |
+| Qwen2.5-7B throughput | Measure before v7 | — pairs/sec (run `v7_qwen_jury.py --throughput-test` first) |
+| Val F0.5 — v5 (embeddings) | Improve over v4 | — not yet run |
+| Val F0.5 — v6 (XGBoost + metaphone) | Improve over v5 | — not yet run |
+| Blocking recall — v6 (+ metaphone) | ≥ 97% | — not yet run |
+| Val F0.5 — v9 (final ensemble) | Maximum | — not yet run |
 
 ---
 
 ## 📝 Session Log
+
+### Session 4 — 2026-09-26
+
+**Who:** User + Claude (via uploaded project zip)
+**What happened:**
+- Reviewed the full project deeply: confirmed v3's methodology is sound (no leakage,
+  proper entity-level split, hard negatives from real blocking candidates, correct
+  macro-F0.5 scorer including singletons).
+- Flagged that this file (HANDOFF.md) had gone stale relative to the actual `src/`
+  contents — `retrain_10k.py`, `v4_fast_inference.py`, and `v4_gpu_inference.py`
+  existed but were never logged here. Fixed in this session's edits.
+- Wrote all remaining versions per VERSIONS.md spec: `v4_calibration.py`,
+  `v5_embeddings.py`, `v6_blocking_metaphone.py`, `v6_xgboost.py`,
+  `v7_qwen_jury.py`, `v8_graph_consistency.py`, `v9_final_ensemble.py`.
+- Updated `README.md` with the full v1→v9 run order and per-version status.
+
+**Decisions made:**
+- v4's ambiguous band is defined data-drivenly (probability bins where positive
+  rate isn't close to 0 or 1) rather than a fixed margin around the threshold,
+  with a hard cap enforcing VERSIONS.md's <20% budget target.
+- v6's "Double Metaphone" uses the `metaphone` PyPI package (true double
+  metaphone) with a graceful fallback to jellyfish's single Metaphone if that
+  package isn't installed, since jellyfish doesn't ship double metaphone.
+- v7's LLM jury is a **veto only** — it can downgrade a classifier "yes" to "no"
+  for ambiguous-band pairs, but never upgrades a "no" to "yes". This matches
+  the precision-first spirit of F0.5 and the fact that v9 only sends
+  classifier-approved pairs into the ambiguous band to begin with.
+- v8's graph consistency runs strictly AFTER v9 generates matching_results.tsv
+  (it edits that file in place and keeps a `_pre_graph` backup).
+
+**Known limitation of this session's work:** none of v4-v9 were executed —
+this repo copy has no dataset files, so nothing could be run end-to-end.
+Treat all new scripts as **unvalidated first drafts**: run them locally in
+the order given in README.md, and expect to file bugs against this session's
+work before trusting any F0.5 number they report.
+
+**Files created/modified:**
+- `code/business_entity_resolution/src/v4_calibration.py` (new)
+- `code/business_entity_resolution/src/v5_embeddings.py` (new)
+- `code/business_entity_resolution/src/v6_blocking_metaphone.py` (new)
+- `code/business_entity_resolution/src/v6_xgboost.py` (new)
+- `code/business_entity_resolution/src/v7_qwen_jury.py` (new)
+- `code/business_entity_resolution/src/v8_graph_consistency.py` (new)
+- `code/business_entity_resolution/src/v9_final_ensemble.py` (new)
+- `code/business_entity_resolution/README.md` (updated run order + version table)
+- `code/business_entity_resolution/requirements.txt` (added `metaphone`, `ollama`)
+- `HANDOFF.md` (this file — synced to actual code state)
+
+**Next session should start at:** Run `v4_calibration.py` first against the
+real mini_train data and report the printed reliability table + band size
+back — that determines whether v5/v6 are worth chasing before v7's LLM step.
+
+---
 
 ### Session 3 — 2026-09-25
 

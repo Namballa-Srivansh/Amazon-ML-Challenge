@@ -26,11 +26,9 @@ import pandas as pd
 # ---------------------------------------------------------------------------
 REPO_ROOT    = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(
                  os.path.abspath(__file__)))))          # c:\Projects\amazon-ml-challenge
-STUDENT_RES  = os.path.join(REPO_ROOT, "6ab10eb3b23ba_student_resource", "student_resource")
-
-TRAIN_DIR    = os.path.join(STUDENT_RES, "dataset", "train")
-TEST_DIR     = os.path.join(STUDENT_RES, "dataset", "test")
-OUTPUT_DIR   = os.path.join(STUDENT_RES, "output")
+TRAIN_DIR    = os.path.join(REPO_ROOT, "dataset", "train")
+TEST_DIR     = os.path.join(REPO_ROOT, "dataset", "test")
+OUTPUT_DIR   = os.path.join(REPO_ROOT, "output")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 
@@ -200,8 +198,7 @@ def main():
         match_col="candidate_entity_ids",
     )
 
-    print("\n[Done] Run Amazon's official validator next (from student_resource/ dir):")
-    print("  cd 6ab10eb3b23ba_student_resource/student_resource")
+    print("\n[Done] Run Amazon's official validator next (from the repo root):")
     print("  python utils/validate_submission.py \\")
     print("      --matching output/matching_results.tsv \\")
     print("      --candidate output/candidate_pairs.tsv \\")
