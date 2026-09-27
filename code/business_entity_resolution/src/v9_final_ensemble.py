@@ -117,7 +117,10 @@ def cos_rows(a, b):
 
 
 def process_chunk(chunk, s23_key_df, s23_names, s23_addrs, s23_name_vecs, s23_addr_vecs,
-                   s23_id2idx, name2vec, addr2vec, model, vec_name, vec_addr, threshold):
+                   s23_id2idx, name2vec, addr2vec, model, vec_name, vec_addr):
+    # NOTE: no `threshold` param -- this now returns the full top-K scored
+    # pool. The caller (main()) splits it into candidates (everything) vs
+    # matches (prob >= threshold).
     EMPTY = pd.DataFrame(columns=["entity_id", "cid", "prob"])
     if chunk.empty: return EMPTY
 
@@ -181,8 +184,12 @@ def process_chunk(chunk, s23_key_df, s23_names, s23_addrs, s23_name_vecs, s23_ad
     pairs["addr_embed_cosine"] = cos_rows(v1a_e, v2a_e)
 
     pairs["prob"] = model.predict_proba(pairs[FEATURES])[:, 1]
-    kept = pairs[pairs["prob"] >= threshold][["entity_id", "cid", "prob"]]
-    return kept
+    # Return the FULL top-K scored pool (not just pairs that passed threshold).
+    # This is what candidate_pairs.tsv is supposed to contain per the spec --
+    # "the final candidate list just before the ML model scores them" -- and
+    # what candidate_entity_ids the score gets computed against, not just the
+    # winners. The caller splits this into candidates vs matches.
+    return pairs[["entity_id", "cid", "prob"]]
 
 
 def final_threshold_sweep(model, vec_name, vec_addr, name2vec, addr2vec):
@@ -368,13 +375,17 @@ def main():
                 for t, v in zip(new_a, embedder.encode(new_a, convert_to_numpy=True)):
                     embedder_cache_addr[t] = v
 
-            df_m = process_chunk(chunk, s23_key_df, s23_names, s23_addrs, s23_name_vecs, s23_addr_vecs,
-                                  s23_id2idx, embedder_cache_name, embedder_cache_addr,
-                                  model, vec_name, vec_addr, threshold)
-            all_matches.append(df_m)
-            print(f"  chunk {i+1}/{n_chunks} rows {start:,}-{end:,} -> {len(df_m):,} matches")
+            df_pool = process_chunk(chunk, s23_key_df, s23_names, s23_addrs, s23_name_vecs, s23_addr_vecs,
+                                     s23_id2idx, embedder_cache_name, embedder_cache_addr,
+                                     model, vec_name, vec_addr)
+            all_candidates.append(df_pool)
+            all_matches.append(df_pool[df_pool["prob"] >= threshold])
+            print(f"  chunk {i+1}/{n_chunks} rows {start:,}-{end:,} -> "
+                  f"{len(df_pool):,} candidates, {(df_pool['prob'] >= threshold).sum():,} matches")
 
     print("\n[3/5] Applying LLM overrides (if v7_llm_decisions.tsv exists)...")
+    final_candidates = pd.concat([d for d in all_candidates if not d.empty], ignore_index=True) \
+                        if any(not d.empty for d in all_candidates) else pd.DataFrame(columns=["entity_id", "cid", "prob"])
     final_matches = pd.concat([d for d in all_matches if not d.empty], ignore_index=True) \
                      if any(not d.empty for d in all_matches) else pd.DataFrame(columns=["entity_id", "cid", "prob"])
 
@@ -384,6 +395,12 @@ def main():
         llm_df["llm_match"] = llm_df["llm_match"].astype(str).str.lower() == "true"
         veto = set(zip(llm_df.loc[~llm_df["llm_match"], "s1_id"], llm_df.loc[~llm_df["llm_match"], "cid"]))
         before = len(final_matches)
+        # LLM veto only removes pairs from the FINAL matches -- a vetoed pair
+        # was still genuinely considered (it was in the ambiguous band the
+        # classifier + blocking produced), so it correctly stays in
+        # candidate_pairs.tsv per the spec ("every ID in matching_results.tsv
+        # should appear here" -- the reverse isn't required, and a vetoed
+        # candidate is real evidence of what the pipeline considered).
         final_matches = final_matches[~final_matches.apply(lambda r: (r["entity_id"], r["cid"]) in veto, axis=1)]
         print(f"  Applied {before - len(final_matches):,} LLM vetoes")
     else:
@@ -391,7 +408,7 @@ def main():
               "(run v7_qwen_jury.py first if you want it).")
 
     print("\n[4/5] Writing candidate_pairs.tsv and matching_results.tsv...")
-    cand_res = (final_matches.groupby("entity_id")["cid"]
+    cand_res = (final_candidates.groupby("entity_id")["cid"]
                 .apply(lambda x: ",".join(sorted(set(x)))).reset_index())
     cand_res.columns = ["source1_entity_id", "candidate_entity_ids"]
     cand_out = (pd.DataFrame({"source1_entity_id": s1["entity_id"]})
@@ -406,11 +423,15 @@ def main():
     match_out.to_csv(os.path.join(OUTPUT_DIR, "matching_results.tsv"), sep="\t", index=False)
 
     matched = (match_out["matched_entity_ids"] != "").sum()
+    avg_candidates = len(final_candidates) / len(s1) if len(s1) else 0.0
     print(f"\n[5/5] SUCCESS!")
-    print(f"  Total S1 rows:    {len(match_out):,}")
-    print(f"  Entities matched: {matched:,}  ({matched/len(match_out):.1%})")
-    print(f"  Threshold used:   {threshold:.2f}")
-    print(f"  Total time:       {time.time()-t0:.0f}s")
+    print(f"  Total S1 rows:          {len(match_out):,}")
+    print(f"  Entities matched:       {matched:,}  ({matched/len(match_out):.1%})")
+    print(f"  Avg candidates/entity:  {avg_candidates:.1f}  "
+          f"(this is now a scored criterion per Amazon's update -- lower is better,")
+    print(f"                          provided recall/F0.5 hold)")
+    print(f"  Threshold used:         {threshold:.2f}")
+    print(f"  Total time:             {time.time()-t0:.0f}s")
     print("\n  NEXT: run v8_graph_consistency.py to prune inconsistent triangles,")
     print("        then utils/validate_submission.py before uploading.")
 

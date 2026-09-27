@@ -39,6 +39,12 @@ MODELS_DIR  = os.path.join(REPO_ROOT, "models")
 
 EMBED_MODEL_NAME = "paraphrase-multilingual-MiniLM-L12-v2"
 EMBED_BATCH_SIZE = 256
+FEATURE_CHUNK_SIZE = 200_000   # rows per chunk in add_all_features_chunked -- keeps
+                                 # TF-IDF transform() and embedding np.stack() calls
+                                 # bounded instead of building 13.7M-row sparse/dense
+                                 # arrays in one shot (that's what caused the MemoryError
+                                 # in vec_addr.transform(ca)). Lower this further (e.g.
+                                 # 50_000) if you still see memory pressure.
 
 FEATURES = [
     "name_jw", "name_lev", "name_tfidf_cosine",
@@ -146,30 +152,64 @@ def main():
     addr_vecs = embedder.encode(all_addrs, batch_size=EMBED_BATCH_SIZE, show_progress_bar=True, convert_to_numpy=True)
     name2vec, addr2vec = dict(zip(all_names, name_vecs)), dict(zip(all_addrs, addr_vecs))
 
-    print("\n[4/6] Building features...")
-    def add_all_features(df, s1n, s1a, cn, ca):
-        df = df.copy()
-        df["name_jw"]  = [safe_jw(a, b)  for a, b in zip(s1n, cn)]
-        df["name_lev"] = [safe_lev(a, b) for a, b in zip(s1n, cn)]
-        df["addr_jw"]  = [safe_jw(a, b)  for a, b in zip(s1a, ca)]
-        df["addr_lev"] = [safe_lev(a, b) for a, b in zip(s1a, ca)]
-        df["num_overlap"] = [num_overlap(a, b) for a, b in zip(s1a, ca)]
+    print("\n[4/6] Building features (chunked to bound memory)...")
 
-        s1n_v = vec_name.transform(s1n);  cn_v  = vec_name.transform(cn)
-        s1a_v = vec_addr.transform(s1a);  ca_v  = vec_addr.transform(ca)
-        df["name_tfidf_cosine"] = np.array(s1n_v.multiply(cn_v).sum(axis=1)).flatten()
-        df["addr_tfidf_cosine"] = np.array(s1a_v.multiply(ca_v).sum(axis=1)).flatten()
-        df["name_x_addr"]    = df["name_tfidf_cosine"] * df["addr_tfidf_cosine"]
-        df["lookalike_flag"] = ((df["name_jw"] > 0.90) & (df["addr_jw"] < 0.50)).astype(int)
+    def add_all_features_chunked(df, s1n, s1a, cn, ca, label: str):
+        """Same feature logic as before, but processes FEATURE_CHUNK_SIZE rows
+        at a time so vec_*.transform() and the embedding np.stack() calls only
+        ever hold one chunk's sparse/dense arrays in memory, not all 13.7M rows'
+        worth at once. Only the small feature columns (not the sparse TF-IDF
+        matrices or embedding vectors themselves) are kept between chunks."""
+        n = len(df)
+        s1_ids  = df["s1_id"].to_numpy()
+        cids    = df["cid"].to_numpy()
+        labels  = df["label"].to_numpy()
+        n_chunks = (n + FEATURE_CHUNK_SIZE - 1) // FEATURE_CHUNK_SIZE
+        parts = []
+        t_start = time.time()
 
-        v1n = np.stack([name2vec[t] for t in s1n]); v2n = np.stack([name2vec[t] for t in cn])
-        v1a = np.stack([addr2vec[t] for t in s1a]); v2a = np.stack([addr2vec[t] for t in ca])
-        df["name_embed_cosine"] = cos_rows(v1n, v2n)
-        df["addr_embed_cosine"] = cos_rows(v1a, v2a)
-        return df
+        for i, start in enumerate(range(0, n, FEATURE_CHUNK_SIZE)):
+            end = min(start + FEATURE_CHUNK_SIZE, n)
+            c_s1n, c_s1a = s1n[start:end], s1a[start:end]
+            c_cn,  c_ca  = cn[start:end],  ca[start:end]
 
-    train_df = add_all_features(train_df, tr_s1n, tr_s1a, tr_cn, tr_ca)
-    val_df   = add_all_features(val_df,   va_s1n, va_s1a, va_cn, va_ca)
+            chunk = pd.DataFrame({
+                "s1_id": s1_ids[start:end],
+                "cid":   cids[start:end],
+                "label": labels[start:end],
+            })
+            chunk["name_jw"]  = [safe_jw(a, b)  for a, b in zip(c_s1n, c_cn)]
+            chunk["name_lev"] = [safe_lev(a, b) for a, b in zip(c_s1n, c_cn)]
+            chunk["addr_jw"]  = [safe_jw(a, b)  for a, b in zip(c_s1a, c_ca)]
+            chunk["addr_lev"] = [safe_lev(a, b) for a, b in zip(c_s1a, c_ca)]
+            chunk["num_overlap"] = [num_overlap(a, b) for a, b in zip(c_s1a, c_ca)]
+
+            # TF-IDF transform + cosine on THIS CHUNK ONLY -- this is the line
+            # that OOM'd at full scale (vec_addr.transform(ca) over 13.7M rows)
+            s1n_v = vec_name.transform(c_s1n); cn_v = vec_name.transform(c_cn)
+            s1a_v = vec_addr.transform(c_s1a); ca_v = vec_addr.transform(c_ca)
+            chunk["name_tfidf_cosine"] = np.array(s1n_v.multiply(cn_v).sum(axis=1)).flatten()
+            chunk["addr_tfidf_cosine"] = np.array(s1a_v.multiply(ca_v).sum(axis=1)).flatten()
+            chunk["name_x_addr"]    = chunk["name_tfidf_cosine"] * chunk["addr_tfidf_cosine"]
+            chunk["lookalike_flag"] = ((chunk["name_jw"] > 0.90) & (chunk["addr_jw"] < 0.50)).astype(int)
+
+            # Embedding cosine, also chunk-bounded (np.stack over 200k x 384-dim
+            # float32 is ~300MB per array instead of ~21GB at 13.7M rows)
+            v1n = np.stack([name2vec[t] for t in c_s1n]); v2n = np.stack([name2vec[t] for t in c_cn])
+            v1a = np.stack([addr2vec[t] for t in c_s1a]); v2a = np.stack([addr2vec[t] for t in c_ca])
+            chunk["name_embed_cosine"] = cos_rows(v1n, v2n)
+            chunk["addr_embed_cosine"] = cos_rows(v1a, v2a)
+
+            parts.append(chunk)
+            del s1n_v, cn_v, s1a_v, ca_v, v1n, v2n, v1a, v2a
+            if (i + 1) % 5 == 0 or (i + 1) == n_chunks:
+                print(f"    [{label}] chunk {i+1}/{n_chunks} "
+                      f"({end:,}/{n:,} rows, {time.time()-t_start:.0f}s elapsed)")
+
+        return pd.concat(parts, ignore_index=True)
+
+    train_df = add_all_features_chunked(train_df, tr_s1n, tr_s1a, tr_cn, tr_ca, "train")
+    val_df   = add_all_features_chunked(val_df,   va_s1n, va_s1a, va_cn, va_ca, "val")
 
     print("\n[5/6] Training XGBoost...")
     X_train, y_train = train_df[FEATURES], train_df["label"]
@@ -212,6 +252,12 @@ def main():
     print(f"  Best Threshold: {best_t:.2f}")
     print(f"  Best Val F0.5:  {best_f05:.4f}  (compare against v3=0.9332 and v5's logged score)")
 
+    # Write debug_scores.tsv -- v7_qwen_jury.py (and v4_calibration.py's own
+    # fallback path) read this to know which pairs fall in the ambiguous band.
+    debug_out = val_df[["s1_id", "cid", "prob", "label"]].copy()
+    debug_out.to_csv(os.path.join(OUTPUT_DIR, "debug_scores.tsv"), sep="\t", index=False)
+    print(f"  Saved: debug_scores.tsv ({len(debug_out):,} val rows, for v4/v7 to consume)")
+
     pickle.dump(model,    open(os.path.join(MODELS_DIR, "v6_classifier.pkl"), "wb"))
     pickle.dump(vec_name, open(os.path.join(MODELS_DIR, "v6_vec_name.pkl"),   "wb"))
     pickle.dump(vec_addr, open(os.path.join(MODELS_DIR, "v6_vec_addr.pkl"),   "wb"))
@@ -219,10 +265,10 @@ def main():
         f.write(str(best_t))
 
     print(f"\n[Done] v6 finished in {time.time()-t0:.1f}s")
-    print("  Saved: v6_classifier.pkl, v6_vec_name.pkl, v6_vec_addr.pkl, v6_threshold.txt")
-    print("  NOTE: run v4_calibration.py's logic again against this model before v7 if")
-    print("        you want a freshly-calibrated ambiguous band for XGBoost's scores --")
-    print("        XGBoost's predict_proba is not guaranteed as well-calibrated as LR's.")
+    print("  Saved: v6_classifier.pkl, v6_vec_name.pkl, v6_vec_addr.pkl, v6_threshold.txt, debug_scores.tsv")
+    print("  NOTE: run `python v4_calibration.py --model-prefix v6` next to calibrate this")
+    print("        model's scores and define the ambiguous band for v7 -- XGBoost's")
+    print("        predict_proba is not guaranteed as well-calibrated as LR's.")
 
 if __name__ == "__main__":
     main()

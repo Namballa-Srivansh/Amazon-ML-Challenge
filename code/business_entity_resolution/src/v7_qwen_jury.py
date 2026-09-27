@@ -1,12 +1,16 @@
 """
 v7 — llm-ambiguous-band · Qwen2.5-7B jury
 ==========================================
-Routes ONLY the pairs whose v6 classifier score falls inside the
-ambiguous band [low_thresh, high_thresh] (defined by v4_calibration.py --
-re-run that against v6's scores first if you haven't) to a local
-Qwen2.5-7B model via Ollama for a structured match/no-match decision.
-Clear-cut pairs (score below low_thresh or above high_thresh) are left
-exactly as v6 decided them.
+Routes ONLY the pairs whose classifier score falls inside the ambiguous
+band [low_thresh, high_thresh] (defined by `v4_calibration.py
+--model-prefix v6` -- run that first) to a local Qwen2.5-7B model via
+Ollama for a structured match/no-match decision. Clear-cut pairs (score
+below low_thresh or above high_thresh) are left exactly as the classifier
+decided them.
+
+Pass --model-prefix to match whichever model you calibrated (default
+"v6" for the current XGBoost classifier; use "v3" only if you're still
+on the older Logistic Regression model).
 
 License/size constraint check: Qwen2.5-7B-Instruct is Apache 2.0 and
 7.6B params -- inside the MIT/Apache + <=8B rule in the problem statement.
@@ -131,24 +135,31 @@ def main():
     ap.add_argument("--throughput-test", action="store_true")
     ap.add_argument("--sample-size", type=int, default=100)
     ap.add_argument("--time-budget-min", type=float, default=30.0)
+    ap.add_argument("--model-prefix", default="v6",
+                     help="Which model's calibration/band files to use "
+                          "(must match what you ran v4_calibration.py --model-prefix "
+                          "with). Default 'v6' matches the current best classifier.")
     args = ap.parse_args()
+    prefix = args.model_prefix
 
     print("=" * 60)
-    print("v7 — Qwen2.5-7B ambiguous-band jury")
+    print(f"v7 — Qwen2.5-7B ambiguous-band jury (model: {prefix})")
     print("=" * 60)
 
     if args.throughput_test:
         run_throughput_test(args.sample_size)
         return
 
-    for fname in ["v4_band_low.txt", "v4_band_high.txt"]:
+    band_low_fname, band_high_fname = f"v4_band_low_{prefix}.txt", f"v4_band_high_{prefix}.txt"
+    for fname in [band_low_fname, band_high_fname]:
         if not os.path.exists(os.path.join(MODELS_DIR, fname)):
-            print(f"ERROR: {fname} missing. Run v4_calibration.py first "
-                  "(re-run it against v6 scores if you upgraded the classifier).")
+            print(f"ERROR: {fname} missing. Run:")
+            print(f"    python v4_calibration.py --model-prefix {prefix}")
+            print("  first (must match this script's --model-prefix).")
             return
 
-    low_thresh  = float(open(os.path.join(MODELS_DIR, "v4_band_low.txt")).read().strip())
-    high_thresh = float(open(os.path.join(MODELS_DIR, "v4_band_high.txt")).read().strip())
+    low_thresh  = float(open(os.path.join(MODELS_DIR, band_low_fname)).read().strip())
+    high_thresh = float(open(os.path.join(MODELS_DIR, band_high_fname)).read().strip())
     print(f"Ambiguous band: [{low_thresh:.2f}, {high_thresh:.2f}]")
 
     debug_path = os.path.join(OUTPUT_DIR, "debug_scores.tsv")
