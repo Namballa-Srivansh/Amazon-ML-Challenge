@@ -1,67 +1,74 @@
 """
-create_mini_dataset.py
-======================
-Creates a 5% miniature training set for rapid local development.
-It samples S1, then guarantees that all true matches for those S1 entities
-are included from S2 and S3, along with some random noise.
+create_mini_train.py — Fast mini_train creator from real train data
+===================================================================
+Samples 100,000 S1 entities + all their GT matches from S2/S3 + random negatives.
+Designed to run in ~2 minutes on a laptop with the full train data.
 """
 
-import os
+import sys
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+import os, time
 import pandas as pd
 import numpy as np
 
-# Paths
-REPO_ROOT   = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-STUDENT_RES = os.path.join(REPO_ROOT, "6ab10eb3b23ba_student_resource", "student_resource")
-TRAIN_DIR   = os.path.join(STUDENT_RES, "dataset", "train")
-MINI_DIR    = os.path.join(STUDENT_RES, "dataset", "mini_train")
+REPO_ROOT  = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+TRAIN_DIR  = os.path.join(REPO_ROOT, "dataset", "train")
+MINI_DIR   = os.path.join(REPO_ROOT, "dataset", "mini_train")
+SAMPLE_N   = 100_000
+SEED       = 42
 
 os.makedirs(MINI_DIR, exist_ok=True)
 
-N_S1_SAMPLES = 100_000   # Take 100k out of 2.2M (approx 5%)
-
 def main():
-    print(f"Creating mini training set ({N_S1_SAMPLES:,} S1 entities)...")
-    
-    # 1. Sample S1
-    print("Loading S1...")
-    s1 = pd.read_csv(os.path.join(TRAIN_DIR, "train_source1.tsv"), sep="\t", dtype=str)
-    s1_mini = s1.sample(n=N_S1_SAMPLES, random_state=42)
-    s1_mini.to_csv(os.path.join(MINI_DIR, "train_source1.tsv"), sep="\t", index=False)
-    
-    # 2. Get Ground Truth for those S1s
-    print("Filtering Ground Truth...")
-    gt = pd.read_csv(os.path.join(TRAIN_DIR, "train_ground_truth.tsv"), sep="\t", dtype=str).fillna("")
-    gt_mini = gt[gt["source1_entity_id"].isin(s1_mini["entity_id"])]
-    gt_mini.to_csv(os.path.join(MINI_DIR, "train_ground_truth.tsv"), sep="\t", index=False)
-    
-    # Extract all S2/S3 IDs that are true matches for our sample
-    required_s23_ids = set()
-    for _, row in gt_mini.iterrows():
-        matches = [m.strip() for m in row["matched_entity_ids"].split(",") if m.strip()]
-        required_s23_ids.update(matches)
-        
-    print(f"Required S2/S3 true matches: {len(required_s23_ids):,}")
-    
-    # 3. Filter S2 and S3 (keep required matches + some random noise)
-    for source in ["source2", "source3"]:
-        print(f"Processing {source}...")
-        df = pd.read_csv(os.path.join(TRAIN_DIR, f"train_{source}.tsv"), sep="\t", dtype=str)
-        
-        # Split into required and others
-        mask_required = df["entity_id"].isin(required_s23_ids)
-        df_required = df[mask_required]
-        df_others = df[~mask_required]
-        
-        # Sample random noise (approx 150k per source)
-        df_noise = df_others.sample(n=min(150_000, len(df_others)), random_state=42)
-        
-        # Combine
-        df_mini = pd.concat([df_required, df_noise]).sample(frac=1, random_state=42) # shuffle
-        df_mini.to_csv(os.path.join(MINI_DIR, f"train_{source}.tsv"), sep="\t", index=False)
-        print(f"  Saved {len(df_mini):,} rows for {source}")
+    t0 = time.time()
+    print("Loading full train data (this takes ~30s)...")
 
-    print(f"\n✅ Mini dataset created at: {MINI_DIR}")
+    s1 = pd.read_csv(os.path.join(TRAIN_DIR, "train_source1.tsv"), sep="\t", dtype=str).fillna("")
+    gt = pd.read_csv(os.path.join(TRAIN_DIR, "train_ground_truth.tsv"), sep="\t", dtype=str).fillna("")
+    s2 = pd.read_csv(os.path.join(TRAIN_DIR, "train_source2.tsv"), sep="\t", dtype=str).fillna("")
+    s3 = pd.read_csv(os.path.join(TRAIN_DIR, "train_source3.tsv"), sep="\t", dtype=str).fillna("")
+
+    print(f"  S1: {len(s1):,} | S2: {len(s2):,} | S3: {len(s3):,} | GT: {len(gt):,}")
+
+    # Sample S1
+    sample_n = min(SAMPLE_N, len(s1))
+    s1_sample = s1.sample(n=sample_n, random_state=SEED).reset_index(drop=True)
+    s1_ids = set(s1_sample["entity_id"])
+
+    # Get GT for sampled S1s
+    gt_sample = gt[gt["source1_entity_id"].isin(s1_ids)].reset_index(drop=True)
+
+    # Collect all S2/S3 IDs referenced in ground truth
+    needed_ids = set()
+    for row in gt_sample.itertuples():
+        if row.matched_entity_ids:
+            for mid in row.matched_entity_ids.split(","):
+                if mid: needed_ids.add(mid)
+
+    needed_s2 = needed_ids & set(s2["entity_id"])
+    needed_s3 = needed_ids & set(s3["entity_id"])
+
+    # Include true matches + random noise records
+    noise_s2 = s2[~s2["entity_id"].isin(needed_s2)].sample(n=min(50000, len(s2)), random_state=SEED)
+    noise_s3 = s3[~s3["entity_id"].isin(needed_s3)].sample(n=min(50000, len(s3)), random_state=SEED)
+
+    s2_sample = pd.concat([s2[s2["entity_id"].isin(needed_s2)], noise_s2]).drop_duplicates("entity_id").reset_index(drop=True)
+    s3_sample = pd.concat([s3[s3["entity_id"].isin(needed_s3)], noise_s3]).drop_duplicates("entity_id").reset_index(drop=True)
+
+    # Save
+    s1_sample.to_csv(os.path.join(MINI_DIR, "train_source1.tsv"), sep="\t", index=False)
+    s2_sample.to_csv(os.path.join(MINI_DIR, "train_source2.tsv"), sep="\t", index=False)
+    s3_sample.to_csv(os.path.join(MINI_DIR, "train_source3.tsv"), sep="\t", index=False)
+    gt_sample.to_csv(os.path.join(MINI_DIR, "train_ground_truth.tsv"), sep="\t", index=False)
+
+    print(f"\nSaved mini_train:")
+    print(f"  S1:  {len(s1_sample):,}")
+    print(f"  S2:  {len(s2_sample):,}  ({len(needed_s2):,} true matches + noise)")
+    print(f"  S3:  {len(s3_sample):,}  ({len(needed_s3):,} true matches + noise)")
+    print(f"  GT:  {len(gt_sample):,}")
+    print(f"  Time: {time.time()-t0:.0f}s")
 
 if __name__ == "__main__":
     main()

@@ -54,6 +54,7 @@ MODELS_DIR  = os.path.join(REPO_ROOT, "models")
 EMBED_MODEL_NAME  = "paraphrase-multilingual-MiniLM-L12-v2"
 EMBED_BATCH_SIZE  = 256
 MAX_PAIRS_PER_KEY = 150_000
+PER_ENTITY_CAP    = 100
 S1_CHUNK_SIZE     = 5_000
 K                 = 50
 FEATURE_CHUNK_SIZE = 200_000   # used by final_threshold_sweep() -- same fix as
@@ -141,10 +142,15 @@ def process_chunk(chunk, s23_key_df, s23_names, s23_addrs, s23_name_vecs, s23_ad
     c1, c23 = s1_exp["bkey"].value_counts(), s23_rel["bkey"].value_counts()
     safe = set(k for k, n1 in c1.items() if n1 * c23.get(k, 0) <= MAX_PAIRS_PER_KEY)
 
-    pairs = (s1_exp[s1_exp["bkey"].isin(safe)]
+    joined = (s1_exp[s1_exp["bkey"].isin(safe)]
              .merge(s23_rel[s23_rel["bkey"].isin(safe)].rename(columns={"entity_id": "cid"}), on="bkey")
-             [["entity_id", "cid"]].drop_duplicates())
-    if pairs.empty: return EMPTY
+             [["entity_id", "cid"]])
+             
+    if joined.empty: return EMPTY
+
+    scored = joined.groupby(["entity_id", "cid"]).size().reset_index(name="shared_key_count")
+    scored = scored.sort_values(["entity_id", "shared_key_count"], ascending=[True, False])
+    pairs = scored.groupby("entity_id").head(PER_ENTITY_CAP)[["entity_id", "cid"]]
 
     s1n_full = chunk["business_name"].fillna("").str.lower()
     s1a_full = chunk["business_address"].fillna("").str.lower()
