@@ -40,6 +40,7 @@ import pandas as pd
 REPO_ROOT   = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(
                 os.path.abspath(__file__)))))
 TRAIN_DIR   = os.path.join(REPO_ROOT, "dataset", "mini_train")
+TEST_DIR    = os.path.join(REPO_ROOT, "dataset", "test")
 OUTPUT_DIR  = os.path.join(REPO_ROOT, "output")
 MODELS_DIR  = os.path.join(REPO_ROOT, "models")
 
@@ -139,6 +140,17 @@ def main():
                      help="Which model's calibration/band files to use "
                           "(must match what you ran v4_calibration.py --model-prefix "
                           "with). Default 'v6' matches the current best classifier.")
+    ap.add_argument("--source", choices=["train", "test"], default="test",
+                     help="'test' (default): judge REAL test-set ambiguous pairs from "
+                          "output/test_candidate_scores.tsv (written by v9_final_ensemble.py) "
+                          "-- this is what actually affects your submission. "
+                          "'train': judge mini_train validation pairs from "
+                          "output/debug_scores.tsv instead -- useful only for offline "
+                          "evaluation of how good the LLM jury is, has NO effect on the "
+                          "real submission since those entity IDs don't exist in the test set.")
+    ap.add_argument("--scores-file", default=None,
+                     help="Override the default scores file path for --source. "
+                          "Usually leave unset -- the default per --source is correct.")
     args = ap.parse_args()
     prefix = args.model_prefix
 
@@ -160,19 +172,30 @@ def main():
 
     low_thresh  = float(open(os.path.join(MODELS_DIR, band_low_fname)).read().strip())
     high_thresh = float(open(os.path.join(MODELS_DIR, band_high_fname)).read().strip())
-    print(f"Ambiguous band: [{low_thresh:.2f}, {high_thresh:.2f}]")
+    print(f"Ambiguous band: [{low_thresh:.2f}, {high_thresh:.2f}]  (source: {args.source})")
 
-    debug_path = os.path.join(OUTPUT_DIR, "debug_scores.tsv")
+    if args.source == "test":
+        default_scores = os.path.join(OUTPUT_DIR, "test_candidate_scores.tsv")
+        src_dir, prefix1, prefix2, prefix3 = TEST_DIR, "test_source1.tsv", "test_source2.tsv", "test_source3.tsv"
+        missing_hint = ("Run v9_final_ensemble.py first -- it writes "
+                         "test_candidate_scores.tsv before applying the final threshold.")
+    else:
+        default_scores = os.path.join(OUTPUT_DIR, "debug_scores.tsv")
+        src_dir, prefix1, prefix2, prefix3 = TRAIN_DIR, "train_source1.tsv", "train_source2.tsv", "train_source3.tsv"
+        missing_hint = ("Run generate_debug_scores.py (or v6_xgboost.py) first -- "
+                         "it writes debug_scores.tsv. NOTE: this only evaluates the "
+                         "LLM jury offline -- it will NOT affect your real submission.")
+
+    debug_path = args.scores_file or default_scores
     if not os.path.exists(debug_path):
-        print(f"ERROR: {debug_path} missing. Run the classifier script "
-              "(v3/v5/v6) first -- it writes debug_scores.tsv.")
+        print(f"ERROR: {debug_path} missing. {missing_hint}")
         return
 
-    print("\nLoading source text for ambiguous pairs...")
-    s1  = pd.read_csv(os.path.join(TRAIN_DIR, "train_source1.tsv"), sep="\t", dtype=str).fillna("")
+    print(f"\nLoading source text for ambiguous pairs (--source={args.source})...")
+    s1  = pd.read_csv(os.path.join(src_dir, prefix1), sep="\t", dtype=str).fillna("")
     s23 = pd.concat([
-        pd.read_csv(os.path.join(TRAIN_DIR, "train_source2.tsv"), sep="\t", dtype=str).fillna(""),
-        pd.read_csv(os.path.join(TRAIN_DIR, "train_source3.tsv"), sep="\t", dtype=str).fillna(""),
+        pd.read_csv(os.path.join(src_dir, prefix2), sep="\t", dtype=str).fillna(""),
+        pd.read_csv(os.path.join(src_dir, prefix3), sep="\t", dtype=str).fillna(""),
     ], ignore_index=True)
     s1_dict  = s1.set_index("entity_id")[["business_name", "business_address", "country"]].to_dict("index")
     s23_dict = s23.set_index("entity_id")[["business_name", "business_address", "country"]].to_dict("index")

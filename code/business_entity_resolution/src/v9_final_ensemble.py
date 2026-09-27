@@ -32,7 +32,7 @@ import sys
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-import os, re, time, pickle
+import os, re, time, pickle, argparse
 import numpy as np
 import pandas as pd
 import jellyfish
@@ -56,6 +56,9 @@ EMBED_BATCH_SIZE  = 256
 MAX_PAIRS_PER_KEY = 150_000
 S1_CHUNK_SIZE     = 5_000
 K                 = 50
+FEATURE_CHUNK_SIZE = 200_000   # used by final_threshold_sweep() -- same fix as
+                                 # v6_xgboost.py's MemoryError (13.7M-row candidate
+                                 # set can't be vec.transform()'d / np.stack()'d whole)
 
 FEATURES = [
     "name_jw", "name_lev", "name_tfidf_cosine",
@@ -195,7 +198,16 @@ def process_chunk(chunk, s23_key_df, s23_names, s23_addrs, s23_name_vecs, s23_ad
 def final_threshold_sweep(model, vec_name, vec_addr, name2vec, addr2vec):
     """Re-sweeps the threshold on the FULL mini_train set (train+val together,
     architecture now locked -- per VERSIONS.md v9 spec) using v6's candidate
-    pairs. Falls back to v6_threshold.txt if anything is missing."""
+    pairs. Falls back to v6_threshold.txt if anything is missing.
+
+    CHUNKED (fixed after the same MemoryError pattern hit v6_xgboost.py at
+    13.7M candidate rows): this used to call vec_name.transform()/np.stack()
+    on the entire candidate_pairs.tsv in one shot -- exactly the bug that
+    crashed v6_xgboost.py's feature-building step. Now processes
+    FEATURE_CHUNK_SIZE rows at a time and only keeps the small resulting
+    feature columns between chunks, same pattern as v6_xgboost.py and
+    generate_debug_scores.py.
+    """
     fallback_path = os.path.join(MODELS_DIR, "v6_threshold.txt")
     fallback = float(open(fallback_path).read().strip()) if os.path.exists(fallback_path) else 0.5
 
@@ -224,43 +236,63 @@ def final_threshold_sweep(model, vec_name, vec_addr, name2vec, addr2vec):
         for cid in c_ids:
             pairs.append({"s1_id": s1_id, "cid": cid, "label": int(cid in true_set)})
     df = pd.DataFrame(pairs)
+    print(f"  {len(df):,} full-set candidate pairs to score (chunked at {FEATURE_CHUNK_SIZE:,} rows)")
 
     s1_dict  = s1.set_index("entity_id")[["business_name", "business_address"]].to_dict("index")
     s23_dict = s23.set_index("entity_id")[["business_name", "business_address"]].to_dict("index")
-    s1n = [str(s1_dict.get(i, {}).get("business_name",  "")).lower().strip() for i in df["s1_id"]]
-    s1a = [str(s1_dict.get(i, {}).get("business_address","")).lower().strip() for i in df["s1_id"]]
-    cn  = [str(s23_dict.get(i, {}).get("business_name",  "")).lower().strip() for i in df["cid"]]
-    ca  = [str(s23_dict.get(i, {}).get("business_address","")).lower().strip() for i in df["cid"]]
+    s1n_all = [str(s1_dict.get(i, {}).get("business_name",  "")).lower().strip() for i in df["s1_id"]]
+    s1a_all = [str(s1_dict.get(i, {}).get("business_address","")).lower().strip() for i in df["s1_id"]]
+    cn_all  = [str(s23_dict.get(i, {}).get("business_name",  "")).lower().strip() for i in df["cid"]]
+    ca_all  = [str(s23_dict.get(i, {}).get("business_address","")).lower().strip() for i in df["cid"]]
 
-    df["name_jw"]  = [safe_jw(a, b)  for a, b in zip(s1n, cn)]
-    df["name_lev"] = [safe_lev(a, b) for a, b in zip(s1n, cn)]
-    df["addr_jw"]  = [safe_jw(a, b)  for a, b in zip(s1a, ca)]
-    df["addr_lev"] = [safe_lev(a, b) for a, b in zip(s1a, ca)]
-    df["num_overlap"] = [num_overlap(a, b) for a, b in zip(s1a, ca)]
-    s1n_v, cn_v = vec_name.transform(s1n), vec_name.transform(cn)
-    s1a_v, ca_v = vec_addr.transform(s1a), vec_addr.transform(ca)
-    df["name_tfidf_cosine"] = np.array(s1n_v.multiply(cn_v).sum(axis=1)).flatten()
-    df["addr_tfidf_cosine"] = np.array(s1a_v.multiply(ca_v).sum(axis=1)).flatten()
-    df["name_x_addr"]    = df["name_tfidf_cosine"] * df["addr_tfidf_cosine"]
-    df["lookalike_flag"] = ((df["name_jw"] > 0.90) & (df["addr_jw"] < 0.50)).astype(int)
+    n = len(df)
+    s1_ids_arr = df["s1_id"].to_numpy(); cids_arr = df["cid"].to_numpy(); labels_arr = df["label"].to_numpy()
+    n_chunks = (n + FEATURE_CHUNK_SIZE - 1) // FEATURE_CHUNK_SIZE
+    parts = []
+    t_chunk = time.time()
 
-    all_names, all_addrs = sorted(set(s1n + cn)), sorted(set(s1a + ca))
-    missing_n = [t for t in all_names if t not in name2vec]
-    missing_a = [t for t in all_addrs if t not in addr2vec]
-    if missing_n or missing_a:
-        embedder = SentenceTransformer(EMBED_MODEL_NAME)
-        if missing_n:
-            for t, v in zip(missing_n, embedder.encode(missing_n, convert_to_numpy=True)):
-                name2vec[t] = v
-        if missing_a:
-            for t, v in zip(missing_a, embedder.encode(missing_a, convert_to_numpy=True)):
-                addr2vec[t] = v
-    v1n = np.stack([name2vec[t] for t in s1n]); v2n = np.stack([name2vec[t] for t in cn])
-    v1a = np.stack([addr2vec[t] for t in s1a]); v2a = np.stack([addr2vec[t] for t in ca])
-    df["name_embed_cosine"] = cos_rows(v1n, v2n)
-    df["addr_embed_cosine"] = cos_rows(v1a, v2a)
+    for i, start in enumerate(range(0, n, FEATURE_CHUNK_SIZE)):
+        end = min(start + FEATURE_CHUNK_SIZE, n)
+        c_s1n, c_s1a = s1n_all[start:end], s1a_all[start:end]
+        c_cn,  c_ca  = cn_all[start:end],  ca_all[start:end]
 
-    df["prob"] = model.predict_proba(df[FEATURES])[:, 1]
+        chunk = pd.DataFrame({"s1_id": s1_ids_arr[start:end], "cid": cids_arr[start:end],
+                               "label": labels_arr[start:end]})
+        chunk["name_jw"]  = [safe_jw(a, b)  for a, b in zip(c_s1n, c_cn)]
+        chunk["name_lev"] = [safe_lev(a, b) for a, b in zip(c_s1n, c_cn)]
+        chunk["addr_jw"]  = [safe_jw(a, b)  for a, b in zip(c_s1a, c_ca)]
+        chunk["addr_lev"] = [safe_lev(a, b) for a, b in zip(c_s1a, c_ca)]
+        chunk["num_overlap"] = [num_overlap(a, b) for a, b in zip(c_s1a, c_ca)]
+
+        s1n_v = vec_name.transform(c_s1n); cn_v = vec_name.transform(c_cn)
+        s1a_v = vec_addr.transform(c_s1a); ca_v = vec_addr.transform(c_ca)
+        chunk["name_tfidf_cosine"] = np.array(s1n_v.multiply(cn_v).sum(axis=1)).flatten()
+        chunk["addr_tfidf_cosine"] = np.array(s1a_v.multiply(ca_v).sum(axis=1)).flatten()
+        chunk["name_x_addr"]    = chunk["name_tfidf_cosine"] * chunk["addr_tfidf_cosine"]
+        chunk["lookalike_flag"] = ((chunk["name_jw"] > 0.90) & (chunk["addr_jw"] < 0.50)).astype(int)
+
+        missing_n = [t for t in set(c_s1n + c_cn) if t not in name2vec]
+        missing_a = [t for t in set(c_s1a + c_ca) if t not in addr2vec]
+        if missing_n or missing_a:
+            embedder = SentenceTransformer(EMBED_MODEL_NAME)
+            if missing_n:
+                for t, v in zip(missing_n, embedder.encode(missing_n, convert_to_numpy=True)):
+                    name2vec[t] = v
+            if missing_a:
+                for t, v in zip(missing_a, embedder.encode(missing_a, convert_to_numpy=True)):
+                    addr2vec[t] = v
+        v1n = np.stack([name2vec[t] for t in c_s1n]); v2n = np.stack([name2vec[t] for t in c_cn])
+        v1a = np.stack([addr2vec[t] for t in c_s1a]); v2a = np.stack([addr2vec[t] for t in c_ca])
+        chunk["name_embed_cosine"] = cos_rows(v1n, v2n)
+        chunk["addr_embed_cosine"] = cos_rows(v1a, v2a)
+
+        chunk["prob"] = model.predict_proba(chunk[FEATURES])[:, 1]
+        parts.append(chunk[["s1_id", "cid", "prob", "label"]])
+        del s1n_v, cn_v, s1a_v, ca_v, v1n, v2n, v1a, v2a
+        if (i + 1) % 10 == 0 or (i + 1) == n_chunks:
+            print(f"    chunk {i+1}/{n_chunks} ({end:,}/{n:,} rows, {time.time()-t_chunk:.0f}s elapsed)")
+
+    df = pd.concat(parts, ignore_index=True)
     unique_s1 = df["s1_id"].unique()
 
     def macro_f05_at(t):
@@ -290,6 +322,16 @@ def final_threshold_sweep(model, vec_name, vec_addr, name2vec, addr2vec):
 
 
 def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--skip-inference", action="store_true",
+                     help="Skip the expensive blocking+scoring pass over the test set "
+                          "and instead reload output/test_candidate_scores.tsv (written "
+                          "by a prior full run). Use this for a cheap second pass after "
+                          "running v7_qwen_jury.py --source test against the scores this "
+                          "script exported -- avoids recomputing all test-set candidates "
+                          "just to apply the LLM overrides + threshold.")
+    args = ap.parse_args()
+
     print("=" * 60)
     print("v9 — final ensemble + full test inference")
     print("=" * 60)
@@ -308,86 +350,111 @@ def main():
     embedder_cache_name, embedder_cache_addr = {}, {}
     threshold = final_threshold_sweep(model, vec_name, vec_addr, embedder_cache_name, embedder_cache_addr)
 
-    print(f"\n[2/5] Loading test set + embedder ({EMBED_MODEL_NAME})...")
-    embedder = SentenceTransformer(EMBED_MODEL_NAME)
-    s1  = pd.read_csv(os.path.join(TEST_DIR, "test_source1.tsv"), sep="\t", dtype=str).fillna("")
-    s23 = pd.concat([
-        pd.read_csv(os.path.join(TEST_DIR, "test_source2.tsv"), sep="\t", dtype=str).fillna(""),
-        pd.read_csv(os.path.join(TEST_DIR, "test_source3.tsv"), sep="\t", dtype=str).fillna(""),
-    ], ignore_index=True)
-    s1["nn"]  = s1["business_name"].apply(norm)
-    s1["na"]  = s1["business_address"].fillna("").apply(norm)
-    s23["nn"] = s23["business_name"].apply(norm)
-    s23["na"] = s23["business_address"].fillna("").apply(norm)
-    print(f"  S1: {len(s1):,}  |  S23: {len(s23):,}")
+    s1 = pd.read_csv(os.path.join(TEST_DIR, "test_source1.tsv"), sep="\t", dtype=str).fillna("")
+    scores_path = os.path.join(OUTPUT_DIR, "test_candidate_scores.tsv")
 
-    all_matches, all_candidates = [], []
+    if args.skip_inference:
+        print(f"\n[2/5] --skip-inference: reloading {os.path.basename(scores_path)} "
+              "instead of recomputing...")
+        if not os.path.exists(scores_path):
+            print(f"ERROR: {scores_path} missing -- can't skip inference without a prior "
+                  "full run to reload from. Run without --skip-inference first.")
+            return
+        final_candidates = pd.read_csv(scores_path, sep="\t", dtype={"s1_id": str, "cid": str})
+        final_candidates = final_candidates.rename(columns={"s1_id": "entity_id"})
+        print(f"  Reloaded {len(final_candidates):,} candidate scores")
+    else:
+        print(f"\n[2/5] Loading test set + embedder ({EMBED_MODEL_NAME})...")
+        embedder = SentenceTransformer(EMBED_MODEL_NAME)
+        s23 = pd.concat([
+            pd.read_csv(os.path.join(TEST_DIR, "test_source2.tsv"), sep="\t", dtype=str).fillna(""),
+            pd.read_csv(os.path.join(TEST_DIR, "test_source3.tsv"), sep="\t", dtype=str).fillna(""),
+        ], ignore_index=True)
+        s1["nn"]  = s1["business_name"].apply(norm)
+        s1["na"]  = s1["business_address"].fillna("").apply(norm)
+        s23["nn"] = s23["business_name"].apply(norm)
+        s23["na"] = s23["business_address"].fillna("").apply(norm)
+        print(f"  S1: {len(s1):,}  |  S23: {len(s23):,}")
 
-    # NOTE: country is treated as an open string label -- iterating over
-    # whatever values appear (US, India, France, or anything else) rather
-    # than a hardcoded list. This is the France-generalization requirement.
-    for country in s1["country"].unique():
-        c_s1  = s1[s1["country"] == country].reset_index(drop=True)
-        c_s23 = s23[s23["country"] == country].reset_index(drop=True)
-        if c_s1.empty: continue
-        print(f"\n[{country}] S1={len(c_s1):,}, S23={len(c_s23):,}")
+        all_matches, all_candidates = [], []
 
-        s23_names = c_s23["business_name"].fillna("").str.lower().str.strip().values
-        s23_addrs = c_s23["business_address"].fillna("").str.lower().str.strip().values
-        c_s23_keys = c_s23.copy()
-        c_s23_keys["bkeys"] = c_s23_keys.apply(lambda r: get_keys(r["nn"], r["na"]), axis=1)
-        s23_key_df = (c_s23_keys[["entity_id", "bkeys"]].explode("bkeys")
-                        .dropna(subset=["bkeys"]).rename(columns={"bkeys": "bkey"}))
-        s23_key_df = s23_key_df[s23_key_df["bkey"].str.len() > 3]
-        s23_name_vecs = vec_name.transform(s23_names)
-        s23_addr_vecs = vec_addr.transform(s23_addrs)
-        s23_id2idx = {eid: i for i, eid in enumerate(c_s23["entity_id"])}
+        # NOTE: country is treated as an open string label -- iterating over
+        # whatever values appear (US, India, France, or anything else) rather
+        # than a hardcoded list. This is the France-generalization requirement.
+        for country in s1["country"].unique():
+            c_s1  = s1[s1["country"] == country].reset_index(drop=True)
+            c_s23 = s23[s23["country"] == country].reset_index(drop=True)
+            if c_s1.empty: continue
+            print(f"\n[{country}] S1={len(c_s1):,}, S23={len(c_s23):,}")
 
-        # Cache embeddings for this country's S23 texts once
-        for t in set(s23_names):
-            if t not in embedder_cache_name:
-                pass  # filled in batch below
-        uniq_names = sorted(set(s23_names) - embedder_cache_name.keys())
-        uniq_addrs = sorted(set(s23_addrs) - embedder_cache_addr.keys())
-        if uniq_names:
-            for t, v in zip(uniq_names, embedder.encode(uniq_names, batch_size=EMBED_BATCH_SIZE,
-                                                          show_progress_bar=True, convert_to_numpy=True)):
-                embedder_cache_name[t] = v
-        if uniq_addrs:
-            for t, v in zip(uniq_addrs, embedder.encode(uniq_addrs, batch_size=EMBED_BATCH_SIZE,
-                                                          show_progress_bar=True, convert_to_numpy=True)):
-                embedder_cache_addr[t] = v
+            s23_names = c_s23["business_name"].fillna("").str.lower().str.strip().values
+            s23_addrs = c_s23["business_address"].fillna("").str.lower().str.strip().values
+            c_s23_keys = c_s23.copy()
+            c_s23_keys["bkeys"] = c_s23_keys.apply(lambda r: get_keys(r["nn"], r["na"]), axis=1)
+            s23_key_df = (c_s23_keys[["entity_id", "bkeys"]].explode("bkeys")
+                            .dropna(subset=["bkeys"]).rename(columns={"bkeys": "bkey"}))
+            s23_key_df = s23_key_df[s23_key_df["bkey"].str.len() > 3]
+            s23_name_vecs = vec_name.transform(s23_names)
+            s23_addr_vecs = vec_addr.transform(s23_addrs)
+            s23_id2idx = {eid: i for i, eid in enumerate(c_s23["entity_id"])}
 
-        n_chunks = (len(c_s1) + S1_CHUNK_SIZE - 1) // S1_CHUNK_SIZE
-        for i, start in enumerate(range(0, len(c_s1), S1_CHUNK_SIZE)):
-            end = min(start + S1_CHUNK_SIZE, len(c_s1))
-            chunk = c_s1.iloc[start:end]
-
-            # Cache this chunk's own text embeddings too
-            cn_texts = chunk["business_name"].fillna("").str.lower().tolist()
-            ca_texts = chunk["business_address"].fillna("").str.lower().tolist()
-            new_n = [t for t in set(cn_texts) if t not in embedder_cache_name]
-            new_a = [t for t in set(ca_texts) if t not in embedder_cache_addr]
-            if new_n:
-                for t, v in zip(new_n, embedder.encode(new_n, convert_to_numpy=True)):
+            # Cache embeddings for this country's S23 texts once
+            for t in set(s23_names):
+                if t not in embedder_cache_name:
+                    pass  # filled in batch below
+            uniq_names = sorted(set(s23_names) - embedder_cache_name.keys())
+            uniq_addrs = sorted(set(s23_addrs) - embedder_cache_addr.keys())
+            if uniq_names:
+                for t, v in zip(uniq_names, embedder.encode(uniq_names, batch_size=EMBED_BATCH_SIZE,
+                                                              show_progress_bar=True, convert_to_numpy=True)):
                     embedder_cache_name[t] = v
-            if new_a:
-                for t, v in zip(new_a, embedder.encode(new_a, convert_to_numpy=True)):
+            if uniq_addrs:
+                for t, v in zip(uniq_addrs, embedder.encode(uniq_addrs, batch_size=EMBED_BATCH_SIZE,
+                                                              show_progress_bar=True, convert_to_numpy=True)):
                     embedder_cache_addr[t] = v
 
-            df_pool = process_chunk(chunk, s23_key_df, s23_names, s23_addrs, s23_name_vecs, s23_addr_vecs,
-                                     s23_id2idx, embedder_cache_name, embedder_cache_addr,
-                                     model, vec_name, vec_addr)
-            all_candidates.append(df_pool)
-            all_matches.append(df_pool[df_pool["prob"] >= threshold])
-            print(f"  chunk {i+1}/{n_chunks} rows {start:,}-{end:,} -> "
-                  f"{len(df_pool):,} candidates, {(df_pool['prob'] >= threshold).sum():,} matches")
+            n_chunks = (len(c_s1) + S1_CHUNK_SIZE - 1) // S1_CHUNK_SIZE
+            for i, start in enumerate(range(0, len(c_s1), S1_CHUNK_SIZE)):
+                end = min(start + S1_CHUNK_SIZE, len(c_s1))
+                chunk = c_s1.iloc[start:end]
+
+                # Cache this chunk's own text embeddings too
+                cn_texts = chunk["business_name"].fillna("").str.lower().tolist()
+                ca_texts = chunk["business_address"].fillna("").str.lower().tolist()
+                new_n = [t for t in set(cn_texts) if t not in embedder_cache_name]
+                new_a = [t for t in set(ca_texts) if t not in embedder_cache_addr]
+                if new_n:
+                    for t, v in zip(new_n, embedder.encode(new_n, convert_to_numpy=True)):
+                        embedder_cache_name[t] = v
+                if new_a:
+                    for t, v in zip(new_a, embedder.encode(new_a, convert_to_numpy=True)):
+                        embedder_cache_addr[t] = v
+
+                df_pool = process_chunk(chunk, s23_key_df, s23_names, s23_addrs, s23_name_vecs, s23_addr_vecs,
+                                         s23_id2idx, embedder_cache_name, embedder_cache_addr,
+                                         model, vec_name, vec_addr)
+                all_candidates.append(df_pool)
+                print(f"  chunk {i+1}/{n_chunks} rows {start:,}-{end:,} -> "
+                      f"{len(df_pool):,} candidates ({(df_pool['prob'] >= threshold).sum():,} above threshold)")
+
+        final_candidates = pd.concat([d for d in all_candidates if not d.empty], ignore_index=True) \
+                            if any(not d.empty for d in all_candidates) else pd.DataFrame(columns=["entity_id", "cid", "prob"])
+
+        # Export the FULL scored pool to disk BEFORE thresholding/LLM overrides.
+        # This is what makes `v7_qwen_jury.py --source test` possible -- it needs
+        # real test-set (s1_id, cid, prob) rows to find the actual ambiguous band,
+        # not the mini_train validation rows in debug_scores.tsv. Without this
+        # export, any v7_llm_decisions.tsv you generate would reference training
+        # entity IDs that don't exist in the test set and would silently apply
+        # zero vetoes to the real submission.
+        tmp_path = scores_path + ".tmp"
+        final_candidates.rename(columns={"entity_id": "s1_id"}).to_csv(tmp_path, sep="\t", index=False)
+        os.replace(tmp_path, scores_path)
+        print(f"\n  Exported {len(final_candidates):,} candidate scores to "
+              f"{os.path.basename(scores_path)} (for `v7_qwen_jury.py --source test`)")
 
     print("\n[3/5] Applying LLM overrides (if v7_llm_decisions.tsv exists)...")
-    final_candidates = pd.concat([d for d in all_candidates if not d.empty], ignore_index=True) \
-                        if any(not d.empty for d in all_candidates) else pd.DataFrame(columns=["entity_id", "cid", "prob"])
-    final_matches = pd.concat([d for d in all_matches if not d.empty], ignore_index=True) \
-                     if any(not d.empty for d in all_matches) else pd.DataFrame(columns=["entity_id", "cid", "prob"])
+    final_matches = final_candidates[final_candidates["prob"] >= threshold].copy()
 
     llm_path = os.path.join(OUTPUT_DIR, "v7_llm_decisions.tsv")
     if os.path.exists(llm_path):
