@@ -53,8 +53,32 @@ MODELS_DIR  = os.path.join(REPO_ROOT, "models")
 
 EMBED_MODEL_NAME  = "paraphrase-multilingual-MiniLM-L12-v2"
 EMBED_BATCH_SIZE  = 256
-MAX_PAIRS_PER_KEY = 150_000
-PER_ENTITY_CAP    = 100
+MAX_PAIRS_PER_KEY = 1_000      # dropped hard from 25_000 -> 1_000 under the 3-hour
+                                 # deadline -- 25_000 still let a single 5,000-row
+                                 # chunk produce ~125M joined rows, and pd.factorize()
+                                 # on 125M STRING objects takes 5+ min just to hash
+                                 # them, before the fast int32 groupby/sort even
+                                 # starts. This is a deliberate recall-for-speed
+                                 # tradeoff: pathological hot keys (>1,000 candidates)
+                                 # get dropped entirely rather than partially
+                                 # considered. PER_ENTITY_CAP=100 (ranked by
+                                 # shared_key_count) still governs which of the
+                                 # survivors actually reach scoring, so this mostly
+                                 # costs recall only on unusually generic/common
+                                 # name or address tokens.
+PER_ENTITY_CAP    = 100        # NEW: hard cap on raw blocking candidates per S1
+                                 # entity BEFORE any scoring, ranked by shared-key
+                                 # count. This -- not MAX_PAIRS_PER_KEY -- is what
+                                 # actually prevents the explosion (a single chunk
+                                 # of 5,000 S1 entities hit 86M candidate pairs
+                                 # without this cap, even with hot-key filtering
+                                 # already applied). Keeping MAX_PAIRS_PER_KEY at
+                                 # its original, less aggressive value here since
+                                 # this cap now does the real safety work --
+                                 # dropping MAX_PAIRS_PER_KEY too low (as a first
+                                 # attempt did, to 5,000) discards legitimate
+                                 # blocking keys and risks recall for no added
+                                 # safety benefit once this cap exists.
 S1_CHUNK_SIZE     = 5_000
 K                 = 50
 FEATURE_CHUNK_SIZE = 200_000   # used by final_threshold_sweep() -- same fix as
@@ -142,15 +166,39 @@ def process_chunk(chunk, s23_key_df, s23_names, s23_addrs, s23_name_vecs, s23_ad
     c1, c23 = s1_exp["bkey"].value_counts(), s23_rel["bkey"].value_counts()
     safe = set(k for k, n1 in c1.items() if n1 * c23.get(k, 0) <= MAX_PAIRS_PER_KEY)
 
+    # NOTE: no .drop_duplicates() yet -- keep every (entity_id, cid, bkey) row
+    # so we can count how many distinct keys each pair shares. That count is
+    # the ranking signal for the per-entity cap below (mirrors the approach
+    # in v6_blocking_metaphone.py -- more shared keys is a real, label-free
+    # confidence signal, essentially free since we already have this table).
     joined = (s1_exp[s1_exp["bkey"].isin(safe)]
-             .merge(s23_rel[s23_rel["bkey"].isin(safe)].rename(columns={"entity_id": "cid"}), on="bkey")
-             [["entity_id", "cid"]])
-             
+              .merge(s23_rel[s23_rel["bkey"].isin(safe)].rename(columns={"entity_id": "cid"}), on="bkey")
+              [["entity_id", "cid"]])
     if joined.empty: return EMPTY
 
-    scored = joined.groupby(["entity_id", "cid"]).size().reset_index(name="shared_key_count")
-    scored = scored.sort_values(["entity_id", "shared_key_count"], ascending=[True, False])
-    pairs = scored.groupby("entity_id").head(PER_ENTITY_CAP)[["entity_id", "cid"]]
+    # Per-entity cap, RANKED by shared_key_count. SPEED-CRITICAL: the naive
+    # version of this (groupby/sort directly on the 'entity_id'/'cid' STRING
+    # columns) was measured at ~10-11 min PER CHUNK at 86M joined rows --
+    # pandas hashes/compares Python strings one at a time, which is brutally
+    # slow at this scale. Fix: factorize entity_id/cid into int32 codes
+    # FIRST, do the expensive groupby+sort on those small integers (pandas'
+    # fast path, orders of magnitude quicker), and only map the much smaller
+    # POST-CAP result back to real string IDs. Same data, same ranking
+    # logic -- just never touches 86M string objects in the hot path.
+    entity_codes, entity_uniques = pd.factorize(joined["entity_id"])
+    cid_codes,    cid_uniques    = pd.factorize(joined["cid"])
+    joined_int = pd.DataFrame({"ec": entity_codes, "cc": cid_codes})
+
+    scored_int = (joined_int.groupby(["ec", "cc"]).size()
+                  .reset_index(name="shared_key_count"))
+    scored_int = scored_int.sort_values(["ec", "shared_key_count"], ascending=[True, False])
+    capped_int = scored_int.groupby("ec").head(PER_ENTITY_CAP)
+
+    pairs = pd.DataFrame({
+        "entity_id": entity_uniques[capped_int["ec"].to_numpy()],
+        "cid":       cid_uniques[capped_int["cc"].to_numpy()],
+    }).reset_index(drop=True)
+    if pairs.empty: return EMPTY
 
     s1n_full = chunk["business_name"].fillna("").str.lower()
     s1a_full = chunk["business_address"].fillna("").str.lower()
@@ -336,6 +384,12 @@ def main():
                           "running v7_qwen_jury.py --source test against the scores this "
                           "script exported -- avoids recomputing all test-set candidates "
                           "just to apply the LLM overrides + threshold.")
+    ap.add_argument("--threshold", type=float, default=None,
+                     help="Skip final_threshold_sweep() entirely and use this value "
+                          "instead. Use this if a prior run already printed "
+                          "'Full-set threshold sweep: best_t=...' before crashing/being "
+                          "killed further downstream -- no need to pay for that ~1.5hr "
+                          "sweep again, the training data hasn't changed.")
     args = ap.parse_args()
 
     print("=" * 60)
@@ -354,7 +408,11 @@ def main():
 
     print("\n[1/5] Re-sweeping threshold on the full training set...")
     embedder_cache_name, embedder_cache_addr = {}, {}
-    threshold = final_threshold_sweep(model, vec_name, vec_addr, embedder_cache_name, embedder_cache_addr)
+    if args.threshold is not None:
+        threshold = args.threshold
+        print(f"  Skipping sweep -- using provided --threshold {threshold:.2f}")
+    else:
+        threshold = final_threshold_sweep(model, vec_name, vec_addr, embedder_cache_name, embedder_cache_addr)
 
     s1 = pd.read_csv(os.path.join(TEST_DIR, "test_source1.tsv"), sep="\t", dtype=str).fillna("")
     scores_path = os.path.join(OUTPUT_DIR, "test_candidate_scores.tsv")
@@ -381,6 +439,21 @@ def main():
         s23["nn"] = s23["business_name"].apply(norm)
         s23["na"] = s23["business_address"].fillna("").apply(norm)
         print(f"  S1: {len(s1):,}  |  S23: {len(s23):,}")
+
+        # Disk-backed embedding cache: if a prior run got partway through and
+        # was killed/crashed downstream, this lets you skip re-paying the
+        # ~25min GPU encoding cost on the next attempt. Saved after the full
+        # country loop completes below.
+        embed_cache_path = os.path.join(MODELS_DIR, "v9_embed_cache.pkl")
+        if os.path.exists(embed_cache_path):
+            try:
+                cached = pickle.load(open(embed_cache_path, "rb"))
+                embedder_cache_name.update(cached.get("name", {}))
+                embedder_cache_addr.update(cached.get("addr", {}))
+                print(f"  Loaded embedding cache from disk: {len(embedder_cache_name):,} names, "
+                      f"{len(embedder_cache_addr):,} addresses (skips re-encoding these)")
+            except Exception as e:
+                print(f"  (couldn't load embedding cache, starting fresh: {e})")
 
         all_matches, all_candidates = [], []
 
@@ -419,6 +492,21 @@ def main():
                                                               show_progress_bar=True, convert_to_numpy=True)):
                     embedder_cache_addr[t] = v
 
+            # Save the embedding cache RIGHT HERE -- immediately after the
+            # expensive per-country GPU encode, BEFORE entering the S1 chunk
+            # loop below. This used to only save after the entire country
+            # loop finished, so killing a hung chunk lost the whole 25-min
+            # GPU encoding pass. Now a kill mid-chunk only ever costs you the
+            # (much cheaper) per-chunk incremental encodes, never this.
+            try:
+                tmp_cache = embed_cache_path + ".tmp"
+                pickle.dump({"name": embedder_cache_name, "addr": embedder_cache_addr}, open(tmp_cache, "wb"))
+                os.replace(tmp_cache, embed_cache_path)
+                print(f"  [{country}] Saved embedding cache ({len(embedder_cache_name):,} names, "
+                      f"{len(embedder_cache_addr):,} addresses) before starting chunk loop")
+            except Exception as e:
+                print(f"  (couldn't save embedding cache: {e} -- not fatal, continuing)")
+
             n_chunks = (len(c_s1) + S1_CHUNK_SIZE - 1) // S1_CHUNK_SIZE
             for i, start in enumerate(range(0, len(c_s1), S1_CHUNK_SIZE)):
                 end = min(start + S1_CHUNK_SIZE, len(c_s1))
@@ -445,6 +533,18 @@ def main():
 
         final_candidates = pd.concat([d for d in all_candidates if not d.empty], ignore_index=True) \
                             if any(not d.empty for d in all_candidates) else pd.DataFrame(columns=["entity_id", "cid", "prob"])
+
+        # Save the embedding cache to disk NOW (before export/threshold/LLM
+        # steps that could still fail) so a re-run never re-pays the GPU
+        # encoding cost, regardless of what happens downstream.
+        try:
+            tmp_cache = embed_cache_path + ".tmp"
+            pickle.dump({"name": embedder_cache_name, "addr": embedder_cache_addr}, open(tmp_cache, "wb"))
+            os.replace(tmp_cache, embed_cache_path)
+            print(f"  Saved embedding cache to disk ({len(embedder_cache_name):,} names, "
+                  f"{len(embedder_cache_addr):,} addresses) for future re-runs")
+        except Exception as e:
+            print(f"  (couldn't save embedding cache: {e} -- not fatal, continuing)")
 
         # Export the FULL scored pool to disk BEFORE thresholding/LLM overrides.
         # This is what makes `v7_qwen_jury.py --source test` possible -- it needs

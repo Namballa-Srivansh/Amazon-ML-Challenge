@@ -45,3 +45,8 @@ temp_zip/
 
 
 venv_cuda/
+
+# Models and databases
+models/
+*.pkl
+*.db

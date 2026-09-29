@@ -28,8 +28,8 @@ MODELS_DIR  = os.path.join(REPO_ROOT, "models")
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-MAX_PAIRS_PER_KEY = 150_000
-S1_CHUNK_SIZE     = 5_000   # Lowered to 5k to match V2 exactly
+MAX_PAIRS_PER_KEY = 200
+S1_CHUNK_SIZE     = 1_000   # Lowered to 1000
 K                 = 50      # Keep top 50 candidates before heavy features
 
 # ---------------------------------------------------------------------------
